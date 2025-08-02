@@ -9,7 +9,17 @@ import random
 import time, datetime
 
 
+class SequenceDetails:
+    def __init__(self):
+        self.sequence_count = 0
+        self.sequence = 0
+
 class EEIPClient:
+    """
+    EtherNet/IP Client for Class 1 (implicit) messaging.
+    By default, UDP packets are sent automatically at the RPI interval (auto-send enabled).
+    Set self.udp_auto_send_enabled = False to disable auto-send and use send_udp_once() for manual sending.
+    """
     def __init__(self):
         self.__tcpClient_socket = None
         self.__session_handle = 0
@@ -47,6 +57,13 @@ class EEIPClient:
 
 
         self.__udp_client_receive_closed = False
+        self.sequence_details = SequenceDetails()
+
+        # Controls whether UDP packets are sent automatically at the RPI interval (default: True)
+        self.udp_auto_send_enabled = True
+
+        # User-defined callback for received UDP data
+        self.udp_receive_callback = None
 
     def ListIdentity(self):
         """
@@ -540,9 +557,19 @@ class EEIPClient:
         self.__udp_recv_thread = threading.Thread(target=self.__udp_listen, args=())
         self.__udp_recv_thread.daemon = True
         self.__udp_recv_thread.start()
-        self.__udp_send_thread = threading.Thread(target=self.__send_udp, args=())
-        self.__udp_send_thread.daemon = True
-        self.__udp_send_thread.start()
+        if self.udp_auto_send_enabled:
+            self.__udp_send_thread = threading.Thread(target=self.__send_udp, args=())
+            self.__udp_send_thread.daemon = True
+            self.__udp_send_thread.start()
+
+    def set_udp_receive_callback(self, callback):
+        """
+        Set a callback function to be called when a UDP message is received.
+        The callback should accept one argument: the received data as bytes.
+        """
+        self.udp_receive_callback = callback
+        self.udp_auto_send_enabled = False  # Ensure auto-send is disabled when a callback is set
+
 
 
     def forward_close(self):
@@ -687,6 +714,11 @@ class EEIPClient:
                     self.__t_o_iodata = list()
                     for i in range(0, len(__receivedata_udp)-20-header_offset):
                         self.__t_o_iodata.append(__receivedata_udp[20+i+header_offset])
+                    
+                    # Handle callback if set
+                    if self.udp_receive_callback is not None:
+                        self.udp_receive_callback(self.__t_o_iodata)
+
                     self.__lock_receive_data.release()
                     self.__last_received_implicit_message = datetime.datetime.utcnow()
                     #(self.__t_o_iodata)
@@ -697,80 +729,93 @@ class EEIPClient:
 
             self.__receivedata = bytearray()
 
-    def __send_udp(self):
-        sequence_count = 0
-        sequence = 0
-        while not self.__stoplistening_udp:
-            message = list()
 
-            #-------------------Item Count
-            message.append(2)
+    def SendUDPExplicitly(self, out_data = None):
+        """
+        Sends a UDP packet explicitly 
+        """
+        if self.__udp_server_socket is not None and not self.__stoplistening_udp:
+            self.__send_udp_packet(out_data=out_data)
+
+
+    def __send_udp(self,out_data = None):
+         while not self.__stoplistening_udp:
+            self.__send_udp_packet()
+
+    def __send_udp_packet(self, out_data = None):
+        message = list()
+
+        #-------------------Item Count
+        message.append(2)
+        message.append(0)
+        # -------------------Item Count
+
+        # -------------------Type ID
+        message.append(0x02)
+        message.append(0x80)
+        # -------------------Type ID
+
+        # -------------------Length
+        message.append(0x08)
+        message.append(0x00)
+        # -------------------Length
+
+        # -------------------Connection ID
+        message.append(self.__connection_id_o_t & 0xFF)
+        message.append((self.__connection_id_o_t & 0xFF00) >> 8)
+        message.append((self.__connection_id_o_t & 0xFF0000) >> 16)
+        message.append((self.__connection_id_o_t & 0xFF000000) >> 24)
+        # -------------------Connection ID
+
+        # -------------------sequence count
+        self.sequence_details.sequence_count += 1
+        message.append(self.sequence_details.sequence_count & 0xFF)
+        message.append((self.sequence_details.sequence_count & 0xFF00) >> 8)
+        message.append((self.sequence_details.sequence_count & 0xFF0000) >> 16)
+        message.append((self.sequence_details.sequence_count & 0xFF000000) >> 24)
+        # -------------------sequence count
+
+        # -------------------Type ID
+        message.append(0xB1)
+        message.append(0x00)
+        # -------------------Type ID
+
+        header_offset = 0
+        if self.__o_t_realtime_format  == RealTimeFormat.HEADER32BIT:
+            header_offset = 4
+        o_t_length = self.__o_t_length + header_offset + 2
+
+        # -------------------Length
+        message.append(o_t_length & 0xFF)
+        message.append((o_t_length & 0xFF00) >> 8)
+        # -------------------Length
+
+        # -------------------Sequence count
+        self.sequence_details.sequence += 1
+        if self.__o_t_realtime_format != RealTimeFormat.HEARTBEAT:
+            message.append(self.sequence_details.sequence & 0xFF)
+            message.append((self.sequence_details.sequence & 0xFF00) >> 8)
+        # -------------------Sequence count
+
+        if self.__o_t_realtime_format == RealTimeFormat.HEADER32BIT:
+            message.append(1)
             message.append(0)
-            # -------------------Item Count
-
-            # -------------------Type ID
-            message.append(0x02)
-            message.append(0x80)
-            # -------------------Type ID
-
-            # -------------------Length
-            message.append(0x08)
-            message.append(0x00)
-            # -------------------Length
-
-            # -------------------Connection ID
-            message.append(self.__connection_id_o_t & 0xFF)
-            message.append((self.__connection_id_o_t & 0xFF00) >> 8)
-            message.append((self.__connection_id_o_t & 0xFF0000) >> 16)
-            message.append((self.__connection_id_o_t & 0xFF000000) >> 24)
-            # -------------------Connection ID
-
-            # -------------------sequence count
-            sequence_count += 1
-            message.append(sequence_count & 0xFF)
-            message.append((sequence_count & 0xFF00) >> 8)
-            message.append((sequence_count & 0xFF0000) >> 16)
-            message.append((sequence_count & 0xFF000000) >> 24)
-            # -------------------sequence count
-
-            # -------------------Type ID
-            message.append(0xB1)
-            message.append(0x00)
-            # -------------------Type ID
-
-            header_offset = 0
-            if self.__o_t_realtime_format  == RealTimeFormat.HEADER32BIT:
-                header_offset = 4
-            o_t_length = self.__o_t_length + header_offset + 2
-
-            # -------------------Length
-            message.append(o_t_length & 0xFF)
-            message.append((o_t_length & 0xFF00) >> 8)
-            # -------------------Length
-
-            # -------------------Sequence count
-            sequence += 1
-            if self.__o_t_realtime_format != RealTimeFormat.HEARTBEAT:
-                message.append(sequence & 0xFF)
-                message.append((sequence & 0xFF00) >> 8)
-            # -------------------Sequence count
-
-            if self.__o_t_realtime_format == RealTimeFormat.HEADER32BIT:
-                message.append(1)
-                message.append(0)
-                message.append(0)
-                message.append(0)
-            # -------------------write data
-            #self.o_t_iodata[0] = self.o_t_iodata[0] + 1
-            for i in range(0, self.__o_t_length):
+            message.append(0)
+            message.append(0)
+        # -------------------write data
+        #self.o_t_iodata[0] = self.o_t_iodata[0] + 1
+        for i in range(0, self.__o_t_length):
+            if out_data is not None:
+                message.append(out_data[i])
+            else:
                 message.append(self.o_t_iodata[i])
-            # -------------------write data
+        # -------------------write data
 
-            sock = socket.socket(socket.AF_INET,  # Internet
-                                 socket.SOCK_DGRAM)  # UDP
+        sock = socket.socket(socket.AF_INET,  # Internet
+                                socket.SOCK_DGRAM)  # UDP
 
-            self.__udp_server_socket.sendto(bytearray(message), (self.__ip_address, self.__target_udp_port))
-            time.sleep(float(self.__requested_packet_rate_o_t)/1000000.0)
+        self.__udp_server_socket.sendto(bytearray(message), (self.__ip_address, self.__target_udp_port))
+        time.sleep(float(self.__requested_packet_rate_o_t)/1000000.0)
 
 
     def __listen(self):
